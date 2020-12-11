@@ -1,4 +1,4 @@
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{DMatrix, DVector, Dim, base::storage::Storage, Matrix, base::allocator::Allocator, base::default_allocator::DefaultAllocator};
 use std::path::Path;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -7,9 +7,11 @@ use quadprog_rs::base::{ConvexQP};
 use itertools::izip;
 
 pub struct SVM {
-    vector: DVector<f64>,
-    coef: f64,
-    settings: SVMSettings,
+    pub data: DMatrix<f64>,
+    pub labels: DVector<f64>,
+    pub alphas: DVector<f64>,
+    pub coef: f64,
+    pub settings: SVMSettings,
 }
 
 
@@ -26,6 +28,24 @@ pub enum KernelFunction {
     RBF(f64)
 }
 
+
+impl KernelFunction {
+    pub fn eval<R, C, S1, S2>(&self, x: &Matrix<f64, R, C, S1>, y: &Matrix<f64, R, C, S2>) -> f64 
+    where
+        R: Dim,
+        C: Dim,
+        S1: Storage<f64, R, C>,
+        S2: Storage<f64, R, C>,
+        DefaultAllocator: Allocator<f64, R, C>
+    {
+        match *self {
+            KernelFunction::DotProduct => x.dot(y),
+            KernelFunction::Polynomial(degree, c) => (x.dot(y) + c).powi(degree as i32),
+            KernelFunction::RBF(gamma) => (-gamma * (x - y).norm()).exp()
+        }
+    }
+}
+
 impl SVM {
 
     pub fn from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool, label_col: usize, settings: SVMSettings) -> SVM {
@@ -35,10 +55,10 @@ impl SVM {
         let data = raw_data.remove_column(label_col);
 
 
-        SVM::from(&data, &labels, settings)
+        SVM::from(data, labels, settings)
     }
 
-    pub fn from(data: &DMatrix<f64>, labels: &DVector<f64>, settings: SVMSettings) -> SVM {
+    pub fn from(data: DMatrix<f64>, labels: DVector<f64>, settings: SVMSettings) -> SVM {
         // From given data structs
         let n = data.nrows();
         
@@ -47,13 +67,7 @@ impl SVM {
             
             for (i, x_i) in data.row_iter().enumerate() {
                 for  (j, x_j) in data.row_iter().enumerate().skip(i) {
-                    let k = match settings.kernel {
-                        KernelFunction::DotProduct => x_i.dot(&x_j),
-                        KernelFunction::Polynomial(degree, c) => (x_i.dot(&x_j) + c).powi(degree as i32),
-                        KernelFunction::RBF(gamma) => (-gamma * (x_i - x_j).norm()).exp()
-                    };
-
-                    hess[(i, j)] = labels[i] * labels[j] * k;
+                    hess[(i, j)] = labels[i] * labels[j] * settings.kernel.eval(&x_i, &x_j);
                 }
             }
             hess.fill_lower_triangle_with_upper_triangle();
@@ -80,29 +94,40 @@ impl SVM {
 
         let soln = qp.solve().unwrap();
         let alphas = soln.x;
-        // Change to kernel
-        let vector = (data.transpose() * &alphas).component_mul(labels);
 
         let mut count: usize = 0;
-        // Change x_i.dot(&vec) to K(x_i, vector)
-        let sum: f64 = izip!(alphas.iter(), data.row_iter(), labels.iter())
-                            .filter(|(&alpha, _, _)| { alpha.is_sign_positive() && alpha.is_normal() && 
-                                (alpha - settings.tol).is_sign_positive() && (alpha - settings.tol).is_normal()})
-                            .map(|(alpha, x_i, y_i)| {count += 1; - alpha * y_i * x_i.dot(&vector)}).sum();
         
-        let coef = sum / count as f64;
+        let indices = alphas.iter().enumerate().filter(|(_, &alpha)| { alpha.is_sign_positive() && alpha.is_normal() && 
+            (alpha - settings.tol).is_sign_positive() && (alpha - settings.tol).is_normal()}).map(|(i, _)| {count += 1; i});
+        
+        let mut sum: f64 = 0.0;
+        
+        let alpha_y = labels.component_mul(&alphas);
+        for i in indices {
+            sum += labels[i] - alpha_y.dot(&qp.hess.column(i));
+        }
+
+        let coef = sum/(count as f64);
         
         SVM {
-            vector,
+            data,
+            labels,
+            alphas,
             coef,
-            settings: settings,
+            settings,
         }
     }
 
-    fn eval(&self, data: DVector<f64>) -> f64 {
+    pub fn eval(&self, data: DVector<f64>) -> f64 {
         // Evaluate a new data against the model
-        0.0
+        let mut sum = self.coef;
+        let data_row = data.transpose();
+        for (row, alpha, y) in izip!(self.data.row_iter(), self.alphas.iter(), self.labels.iter()){
+            sum += alpha*y*self.settings.kernel.eval(&row, &data_row);
+        }
+        sum
     }
+
 }
 
 fn f64matrix_from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool) -> DMatrix<f64> {
