@@ -1,16 +1,14 @@
 use nalgebra::{DMatrix, DVector, Dim, base::storage::Storage, Matrix, base::allocator::Allocator, base::default_allocator::DefaultAllocator};
 use std::path::Path;
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::BufReader;
-use quadprog_rs::base::{ConvexQP};
+use quadprog_rs::base::{ConvexQP, QPOptions};
 use itertools::izip;
 
 pub struct SVM {
     pub data: DMatrix<f64>,
     pub labels: DVector<f64>,
-    pub alphas: DVector<f64>,
-    pub coef: f64,
+    alphas: Option<DVector<f64>>,
+    coef: Option<f64>,
     pub settings: SVMSettings,
 }
 
@@ -19,6 +17,7 @@ pub struct SVM {
 pub struct SVMSettings {
     pub kernel: KernelFunction,
     pub tol: f64,
+    pub solver_settings: QPOptions,
 }
 
 #[derive(Copy, Clone)]
@@ -28,6 +27,15 @@ pub enum KernelFunction {
     RBF(f64)
 }
 
+impl Default for SVMSettings {
+    fn default() -> SVMSettings { 
+        SVMSettings{
+            kernel: KernelFunction::DotProduct,
+            tol: f64::INFINITY,
+            solver_settings: QPOptions::default()
+        }
+    }
+}
 
 impl KernelFunction {
     pub fn eval<R, C, S1, S2>(&self, x: &Matrix<f64, R, C, S1>, y: &Matrix<f64, R, C, S2>) -> f64 
@@ -46,6 +54,7 @@ impl KernelFunction {
     }
 }
 
+
 impl SVM {
 
     pub fn from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool, label_col: usize, settings: SVMSettings) -> SVM {
@@ -55,32 +64,65 @@ impl SVM {
         let data = raw_data.remove_column(label_col);
 
 
-        SVM::from(data, labels, settings)
+        SVM{
+            data,
+            labels,
+            alphas: None,
+            coef: None,
+            settings
+        }
     }
 
-    pub fn from(data: DMatrix<f64>, labels: DVector<f64>, settings: SVMSettings) -> SVM {
-        // From given data structs
-        let n = data.nrows();
+    pub fn from(data: DMatrix<f64>, labels: DVector<f64>, settings: SVMSettings) -> SVM{
+        SVM{
+            data,
+            labels,
+            alphas: None,
+            coef: None,
+            settings
+        }
+    }
+
+
+    pub fn eval(&self, data: &DVector<f64>) -> f64 {
+        // Evaluate new data against the model
+        
+        match (self.alphas.as_ref(), self.coef.as_ref()){
+            (Some(alphas), Some(coef)) => {
+                let mut sum = *coef;
+                let data_row = data.transpose();
+                for (row, alpha, y) in izip!(self.data.row_iter(), alphas.iter(), self.labels.iter()){
+                    sum += alpha * y * self.settings.kernel.eval(&row, &data_row);
+                }
+                sum
+            },
+            _ => { f64::NAN }
+        }
+        
+    }
+
+    pub fn fit(&mut self) {
+        let n = self.data.nrows();
         
         let hess = {
             let mut hess = DMatrix::<f64>::zeros(n, n);
             
-            for (i, x_i) in data.row_iter().enumerate() {
-                for  (j, x_j) in data.row_iter().enumerate().skip(i) {
-                    hess[(i, j)] = labels[i] * labels[j] * settings.kernel.eval(&x_i, &x_j);
+            for (i, x_i) in self.data.row_iter().enumerate() {
+                for  (j, x_j) in self.data.row_iter().enumerate().skip(i) {
+                    hess[(i, j)] =  self.labels[i] * self.labels[j] * self.settings.kernel.eval(&x_i, &x_j);
                 }
             }
             hess.fill_lower_triangle_with_upper_triangle();
             hess
         };
 
-        let c = DVector::<f64>::repeat(n, 1.0);
-        let eq_constraint: DMatrix<f64> = DMatrix::<f64>::from_iterator(n, 1, labels.iter().map(|x|{*x}));
+        let c = DVector::<f64>::repeat(n, -1.0);
+        let eq_constraint: DMatrix<f64> = DMatrix::<f64>::from_iterator(1, n, self.labels.iter().map(|x|{*x}));
         
         let mut bounds: BTreeMap<usize, (Option<f64>, Option<f64>)> = BTreeMap::new();
         
         for i in 0..n{
-            bounds.insert(i, (Some(0.0), Some(settings.tol)));
+            bounds.insert(i, (Some(0.0), Some(self.settings.tol)));
         }
 
         let qp = ConvexQP{
@@ -89,45 +131,41 @@ impl SVM {
             a_eq: Some(eq_constraint),
             b_eq: Some(DVector::<f64>::zeros(1)),
             bounds: Some(bounds),
+            options: self.settings.solver_settings,
             ..Default::default()
         };
 
         let soln = qp.solve().unwrap();
+        println!("{}", soln.iterations);
         let alphas = soln.x;
 
         let mut count: usize = 0;
         
-        let indices = alphas.iter().enumerate().filter(|(_, &alpha)| { alpha.is_sign_positive() && alpha.is_normal() && 
-            (alpha - settings.tol).is_sign_positive() && (alpha - settings.tol).is_normal()}).map(|(i, _)| {count += 1; i});
+        let indices = alphas.iter().enumerate().filter(|(_, &alpha)| {
+            alpha > 1e-6 && alpha < self.settings.tol * 0.98
+        }).map(|(i, _)| {count += 1; i});
         
         let mut sum: f64 = 0.0;
         
-        let alpha_y = labels.component_mul(&alphas);
         for i in indices {
-            sum += labels[i] - alpha_y.dot(&qp.hess.column(i));
+            let a = self.labels[i] - self.labels[i] * alphas.dot(&qp.hess.column(i));
+            println!("{}", a);
+            sum += a;
         }
 
         let coef = sum/(count as f64);
-        
-        SVM {
-            data,
-            labels,
-            alphas,
-            coef,
-            settings,
-        }
+
+        self.alphas = Some(alphas);
+        self.coef = Some(coef);
     }
 
-    pub fn eval(&self, data: DVector<f64>) -> f64 {
-        // Evaluate a new data against the model
-        let mut sum = self.coef;
-        let data_row = data.transpose();
-        for (row, alpha, y) in izip!(self.data.row_iter(), self.alphas.iter(), self.labels.iter()){
-            sum += alpha*y*self.settings.kernel.eval(&row, &data_row);
-        }
-        sum
+    pub fn get_alphas(&self) -> &Option<DVector<f64>> {
+        &self.alphas
     }
 
+    pub fn get_coef(&self) -> &Option<f64> {
+        &self.coef
+    }
 }
 
 fn f64matrix_from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool) -> DMatrix<f64> {
@@ -143,5 +181,47 @@ fn f64matrix_from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: 
         v.append(&mut record.iter().map(|s| -> f64 {s.parse().unwrap()}).collect());
     }
 
+
     DMatrix::<f64>::from_vec(n, m, v).transpose()
+}
+
+mod tests {
+    use super::{SVM, SVMSettings};
+    use nalgebra::{DMatrix, DVector};
+    use rand::{distributions::Distribution, distributions::Uniform};
+
+    #[test]
+    fn dot_prod_test_set() {
+        let mut model = SVM::from_csv(50, 3, "test_sets/linear_test_set.csv", false, 2, SVMSettings::default());
+
+        model.fit();
+
+        
+        let alphas = model.alphas.as_ref().unwrap().clone();
+        let vec = alphas.component_mul(&model.labels).transpose() * &model.data;
+        
+        println!("Coef: {:?}", model.get_coef());
+        println!("Vector: {}", vec);
+
+        let real_boundry = |x: &DVector<f64>| -> f64 {
+            x[0] + x[1] + 0.5
+        };
+
+        let mut v = DVector::<f64>::zeros(2);
+        let between = Uniform::<f64>::from(-1.0..1.0);
+        let mut rng = rand::thread_rng();
+        
+        let n = 100;
+        println!("Testing new data...");
+        println!("Attempt\tReal Score\t\tModel Score\t\tPass");
+        for i in 0..n {
+            v[0] = between.sample(&mut rng);
+            v[1] = between.sample(&mut rng);
+            let real_score = real_boundry(&v);
+            let model_score = model.eval(&v);
+            let pass = (real_score * model_score).is_sign_positive();
+            println!("{}\t{}\t{}\t{}", i, real_score, model_score, pass)
+        }
+
+    }
 }
