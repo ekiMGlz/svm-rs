@@ -2,8 +2,10 @@ use nalgebra::{DMatrix, DVector, Dim, base::storage::Storage, Matrix, base::allo
 use std::path::Path;
 use std::collections::BTreeMap;
 use quadprog_rs::base::{ConvexQP, QPOptions};
+use serde::{Serialize, Deserialize};
 use itertools::izip;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SVM {
     pub data: DMatrix<f64>,
     pub labels: DVector<f64>,
@@ -13,14 +15,14 @@ pub struct SVM {
 }
 
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct SVMSettings {
     pub kernel: KernelFunction,
     pub tol: f64,
     pub solver_settings: QPOptions,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub enum KernelFunction {
     DotProduct,
     Polynomial(usize, f64),
@@ -49,7 +51,7 @@ impl KernelFunction {
         match *self {
             KernelFunction::DotProduct => x.dot(y),
             KernelFunction::Polynomial(degree, c) => (x.dot(y) + c).powi(degree as i32),
-            KernelFunction::RBF(gamma) => (-gamma * (x - y).norm()).exp()
+            KernelFunction::RBF(gamma) => (-gamma * (x - y).norm_squared()).exp()
         }
     }
 }
@@ -136,7 +138,6 @@ impl SVM {
         };
 
         let soln = qp.solve().unwrap();
-        println!("{}", soln.iterations);
         let alphas = soln.x;
 
         let mut count: usize = 0;
@@ -149,7 +150,6 @@ impl SVM {
         
         for i in indices {
             let a = self.labels[i] - self.labels[i] * alphas.dot(&qp.hess.column(i));
-            println!("{}", a);
             sum += a;
         }
 
@@ -186,22 +186,21 @@ fn f64matrix_from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: 
 }
 
 mod tests {
-    use super::{SVM, SVMSettings};
+    use super::{SVM, SVMSettings, KernelFunction};
     use nalgebra::{DMatrix, DVector};
+    use std::fs::File;
+    use std::io::Write;
     use rand::{distributions::Distribution, distributions::Uniform};
 
     #[test]
-    fn dot_prod_test_set() {
+    fn dot_prod_test_set() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = SVM::from_csv(50, 3, "test_sets/linear_test_set.csv", false, 2, SVMSettings::default());
 
         model.fit();
 
-        
-        let alphas = model.alphas.as_ref().unwrap().clone();
-        let vec = alphas.component_mul(&model.labels).transpose() * &model.data;
-        
-        println!("Coef: {:?}", model.get_coef());
-        println!("Vector: {}", vec);
+        let mut file = File::create("test_results/linear_model.json").unwrap();
+        let j = serde_json::to_string(&model)?;
+        write!(file, "{}", j)?;
 
         let real_boundry = |x: &DVector<f64>| -> f64 {
             x[0] + x[1] + 0.5
@@ -210,18 +209,97 @@ mod tests {
         let mut v = DVector::<f64>::zeros(2);
         let between = Uniform::<f64>::from(-1.0..1.0);
         let mut rng = rand::thread_rng();
-        
+
+        let mut file = File::create("test_results/linear_results.csv")?;
+
         let n = 100;
-        println!("Testing new data...");
-        println!("Attempt\tReal Score\t\tModel Score\t\tPass");
-        for i in 0..n {
+        for _ in 0..n {
             v[0] = between.sample(&mut rng);
             v[1] = between.sample(&mut rng);
             let real_score = real_boundry(&v);
             let model_score = model.eval(&v);
             let pass = (real_score * model_score).is_sign_positive();
-            println!("{}\t{}\t{}\t{}", i, real_score, model_score, pass)
+            writeln!(file, "{},{},{}", real_score, model_score, pass)?;
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn poly_test_set() -> Result<(), Box<dyn std::error::Error>> {
+        let settings = SVMSettings{
+            kernel: KernelFunction::Polynomial(2, 1.0),
+            tol: 1_000.0,
+            .. Default::default()
+        };
+
+        let mut model = SVM::from_csv(50, 3, "test_sets/poly_test_set.csv", false, 2, settings);
+
+        model.fit();
+
+        let mut file = File::create("test_results/poly_model.json").unwrap();
+        let j = serde_json::to_string(&model)?;
+        write!(file, "{}", j)?;
+
+        let real_boundry = |x: &DVector<f64>| -> f64 {
+            0.2*(1.0 + 5.0*x[0] - 2.0*x[1]).powi(2) - 0.8*(1.0 - 3.0*x[0] - 4.0*x[1]).powi(2) + 9.0
+        };
+
+        let mut v = DVector::<f64>::zeros(2);
+        let between = Uniform::<f64>::from(-1.0..1.0);
+        let mut rng = rand::thread_rng();
+
+        let mut file = File::create("test_results/poly_results.csv")?;
+
+        let n = 100;
+        for _ in 0..n {
+            v[0] = between.sample(&mut rng);
+            v[1] = between.sample(&mut rng);
+            let real_score = real_boundry(&v);
+            let model_score = model.eval(&v);
+            let pass = (real_score * model_score).is_sign_positive();
+            writeln!(file, "{},{},{}", real_score, model_score, pass)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn rbf_test_set() -> Result<(), Box<dyn std::error::Error>> {
+        let settings = SVMSettings{
+            kernel: KernelFunction::RBF(7.0),
+            tol: 10_000.0,
+            .. Default::default()
+        };
+
+        let mut model = SVM::from_csv(50, 3, "test_sets/rbf_test_set.csv", false, 2, settings);
+
+        model.fit();
+
+        let mut file = File::create("test_results/rbf_model.json").unwrap();
+        let j = serde_json::to_string(&model)?;
+        write!(file, "{}", j)?;
+
+        let real_boundry = |x: &DVector<f64>| -> f64 {
+            0.2*(-7.0*((x[0] - 0.5).powi(2) + (x[1] - 0.5).powi(2))).exp() + 0.8*(-7.0*((x[0] + 0.2).powi(2) + (x[1] + 0.2).powi(2))).exp() - 0.1
+        };
+
+        let mut v = DVector::<f64>::zeros(2);
+        let between = Uniform::<f64>::from(-1.0..1.0);
+        let mut rng = rand::thread_rng();
+
+        let mut file = File::create("test_results/rbf_results.csv")?;
+
+        let n = 100;
+        for _ in 0..n {
+            v[0] = between.sample(&mut rng);
+            v[1] = between.sample(&mut rng);
+            let real_score = real_boundry(&v);
+            let model_score = model.eval(&v);
+            let pass = (real_score * model_score).is_sign_positive();
+            writeln!(file, "{},{},{}", real_score, model_score, pass)?;
+        }
+
+        Ok(())
     }
 }
