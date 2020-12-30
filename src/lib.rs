@@ -170,7 +170,10 @@ impl SVM {
             ..Default::default()
         };
 
-        let soln = qp.solve()?;
+        let soln = match qp.solve(){
+            Ok(soln) => soln,
+            Err(e) => {self.alphas = None; self.coef = None; return Err(e)}
+        };
         let alphas = soln.x;
 
         let mut count: usize = 0;
