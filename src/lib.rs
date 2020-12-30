@@ -1,11 +1,12 @@
 use nalgebra::{DMatrix, DVector, Dim, base::storage::Storage, Matrix, base::allocator::Allocator, base::default_allocator::DefaultAllocator};
 use std::path::Path;
 use std::collections::BTreeMap;
-use quadprog_rs::base::{ConvexQP, QPOptions};
+use quadprog_rs::base::{ConvexQP, QPOptions, QPError};
 use serde::{Serialize, Deserialize};
 use itertools::izip;
+use std::io::{Error, ErrorKind};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Debug, Deserialize)]
 pub struct SVM {
     pub data: DMatrix<f64>,
     pub labels: DVector<f64>,
@@ -14,15 +15,14 @@ pub struct SVM {
     pub settings: SVMSettings,
 }
 
-
-#[derive(Copy, Clone, Serialize, Deserialize)]
+#[derive(Copy, Clone, Serialize, Debug, Deserialize)]
 pub struct SVMSettings {
     pub kernel: KernelFunction,
     pub tol: f64,
     pub solver_settings: QPOptions,
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum KernelFunction {
     DotProduct,
     Polynomial(usize, f64),
@@ -56,54 +56,83 @@ impl KernelFunction {
     }
 }
 
-
 impl SVM {
 
-    pub fn from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool, label_col: usize, settings: SVMSettings) -> SVM {
+    pub fn from_csv<P: AsRef<Path>>(path: P, has_headers: bool, label_col: usize, settings: SVMSettings) -> Result<SVM, Error> {
         // Parse csv, build model
-        let raw_data = f64matrix_from_csv(m, n, path, has_headers);
-        let labels = raw_data.column(label_col).clone_owned();
+        let raw_data = f64matrix_from_csv(path, has_headers)?;
+        
+        let labels = raw_data.column(label_col).clone_owned().map(|x| {
+            if x.is_sign_positive() {
+                1.0
+            } else {
+                -1.0
+            }
+        });
+
         let data = raw_data.remove_column(label_col);
 
+        // Verify no NaN/infty
+        let test = |x: &f64| {x.is_infinite() || x.is_nan() };
+        if data.iter().any(test) || labels.iter().any(test){
+            return Err(std::io::Error::new(ErrorKind::InvalidInput, "NaN or ±∞ entries"))
+        }
 
-        SVM{
+        Ok(SVM{
             data,
             labels,
             alphas: None,
             coef: None,
             settings
-        }
+        })
     }
 
-    pub fn from(data: DMatrix<f64>, labels: DVector<f64>, settings: SVMSettings) -> SVM{
-        SVM{
+    pub fn from(data: DMatrix<f64>, labels: DVector<f64>, settings: SVMSettings) -> Result<SVM, Error>{
+        
+        // Verify dims
+        if data.nrows() != labels.nrows(){
+            return Err(Error::new(ErrorKind::InvalidData, "Dimension mismatch."))
+        }
+
+        // Verify no NaN/infty
+        let test = |x: &f64| {x.is_infinite() || x.is_nan()};
+        if data.iter().any(test) || labels.iter().any(test){
+            return Err(Error::new(ErrorKind::InvalidInput, "NaN or ±∞ entries"))
+        }
+
+
+        let labels = labels.map(|x| {
+            if x.is_sign_positive() {
+                1.0 
+            } else {
+                -1.0
+            }
+        });
+
+
+
+        Ok(SVM{
             data,
             labels,
             alphas: None,
             coef: None,
             settings
-        }
+        })
     }
 
-
-    pub fn eval(&self, data: &DVector<f64>) -> f64 {
+    pub fn eval(&self, data: &DVector<f64>) -> Option<f64> {
         // Evaluate new data against the model
         
-        match (self.alphas.as_ref(), self.coef.as_ref()){
-            (Some(alphas), Some(coef)) => {
-                let mut sum = *coef;
-                let data_row = data.transpose();
-                for (row, alpha, y) in izip!(self.data.row_iter(), alphas.iter(), self.labels.iter()){
-                    sum += alpha * y * self.settings.kernel.eval(&row, &data_row);
-                }
-                sum
-            },
-            _ => { f64::NAN }
+        let alp = self.alphas.as_ref()?;
+        let mut sum = *self.coef.as_ref()?;
+        let data_row = data.transpose();
+        for (row, alpha, y) in izip!(self.data.row_iter(), alp.iter(), self.labels.iter()){
+            sum += alpha * y * self.settings.kernel.eval(&row, &data_row);
         }
-        
+        Some(sum)
     }
 
-    pub fn fit(&mut self) {
+    pub fn fit(&mut self) -> Result<(), QPError>{
         let n = self.data.nrows();
         
         let hess = {
@@ -137,7 +166,7 @@ impl SVM {
             ..Default::default()
         };
 
-        let soln = qp.solve().unwrap();
+        let soln = qp.solve()?;
         let alphas = soln.x;
 
         let mut count: usize = 0;
@@ -157,6 +186,8 @@ impl SVM {
 
         self.alphas = Some(alphas);
         self.coef = Some(coef);
+
+        Ok(())
     }
 
     pub fn get_alphas(&self) -> &Option<DVector<f64>> {
@@ -168,23 +199,38 @@ impl SVM {
     }
 }
 
-fn f64matrix_from_csv<P: AsRef<Path>>(m: usize, n: usize, path: P, has_headers: bool) -> DMatrix<f64> {
+fn f64matrix_from_csv<P: AsRef<Path>>(path: P, has_headers: bool) -> Result<DMatrix<f64>, Error> {
     let mut reader = csv::ReaderBuilder::new()
-    .has_headers(has_headers)
-    .trim(csv::Trim::All)
-    .from_path(path)
-    .unwrap();
+                                .has_headers(has_headers)
+                                .trim(csv::Trim::All)
+                                .from_path(path)?;
+
+    let mut m = 0;
+    let mut n = 0;
 
     let mut v = Vec::new();
 
-    for record in reader.records().flatten() {
-        v.append(&mut record.iter().map(|s| -> f64 {s.parse().unwrap()}).collect());
+    for record in reader.records() {
+        
+        let r = record?;
+        n = r.len();
+        let items: Result<Vec<_>, _> = r.iter().map(|s| -> Result<f64, Error> {
+            match s.parse(){
+                Ok(f) => {Ok(f)},
+                _ => {Err(Error::new(ErrorKind::InvalidInput, "Cannot parse floating point number from input"))}
+            }
+        }).collect();
+        
+        v.append(&mut items?);
+        m += 1;
     }
 
-
-    DMatrix::<f64>::from_vec(n, m, v).transpose()
+    
+    Ok(DMatrix::<f64>::from_vec(n, m, v).transpose())
 }
 
+
+#[cfg(test)]
 mod tests {
     use super::{SVM, SVMSettings, KernelFunction};
     use nalgebra::{DMatrix, DVector};
@@ -193,10 +239,60 @@ mod tests {
     use rand::{distributions::Distribution, distributions::Uniform};
 
     #[test]
-    fn dot_prod_test_set() -> Result<(), Box<dyn std::error::Error>> {
-        let mut model = SVM::from_csv(50, 3, "test_sets/linear_test_set.csv", false, 2, SVMSettings::default());
+    fn wrong_dims() {
+        let data = DMatrix::<f64>::from_vec(3, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let labels = DVector::<f64>::from_vec(vec![1.0, -1.0]);
 
-        model.fit();
+        assert!(SVM::from(data, labels, SVMSettings::default()).is_err());
+    }
+
+    #[test]
+    fn malformed_csv() {
+        assert!(SVM::from_csv("test_sets/malformed_data.csv", false, 3, SVMSettings::default()).is_err())
+    }
+
+    #[test]
+    fn nonexistent_csv() {
+        assert!(SVM::from_csv("test_sets/nonexistent_data.csv", false, 3, SVMSettings::default()).is_err())
+    }
+
+
+    #[test]
+    fn nan_data() {
+        let model = SVM::from_csv("test_sets/nan.csv", false, 2, SVMSettings::default());
+        assert!(model.is_err());
+    }
+
+    #[test]
+    fn infty_data() {
+        let model = SVM::from_csv("test_sets/infty.csv", false, 2, SVMSettings::default());
+        println!("{:?}", model);
+        assert!(model.is_err());
+    }
+
+    #[test]
+    fn parse_error() {
+        let model = SVM::from_csv("test_sets/parse_error.csv", false, 2, SVMSettings::default());
+        println!("{:?}", model);
+        assert!(model.is_err());
+    }
+
+
+    #[test]
+    fn non_1_labels() {
+        let model = SVM::from_csv("test_sets/labels.csv", false, 3, SVMSettings::default()).unwrap();
+        assert_eq!(model.labels[0], 1.0);
+        assert_eq!(model.labels[1], -1.0);
+        assert_eq!(model.labels[2], 1.0);
+        assert_eq!(model.labels[3], -1.0);
+        
+    }
+
+    #[test]
+    fn dot_prod_test_set() -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = SVM::from_csv("test_sets/linear_test_set.csv", false, 2, SVMSettings::default())?;
+
+        model.fit()?;
 
         let mut file = File::create("test_results/linear_model.json").unwrap();
         let j = serde_json::to_string(&model)?;
@@ -217,7 +313,7 @@ mod tests {
             v[0] = between.sample(&mut rng);
             v[1] = between.sample(&mut rng);
             let real_score = real_boundry(&v);
-            let model_score = model.eval(&v);
+            let model_score = model.eval(&v).unwrap();
             let pass = (real_score * model_score).is_sign_positive();
             writeln!(file, "{},{},{}", real_score, model_score, pass)?;
         }
@@ -233,9 +329,9 @@ mod tests {
             .. Default::default()
         };
 
-        let mut model = SVM::from_csv(50, 3, "test_sets/poly_test_set.csv", false, 2, settings);
+        let mut model = SVM::from_csv("test_sets/poly_test_set.csv", false, 2, settings)?;
 
-        model.fit();
+        model.fit()?;
 
         let mut file = File::create("test_results/poly_model.json").unwrap();
         let j = serde_json::to_string(&model)?;
@@ -256,7 +352,7 @@ mod tests {
             v[0] = between.sample(&mut rng);
             v[1] = between.sample(&mut rng);
             let real_score = real_boundry(&v);
-            let model_score = model.eval(&v);
+            let model_score = model.eval(&v).unwrap();
             let pass = (real_score * model_score).is_sign_positive();
             writeln!(file, "{},{},{}", real_score, model_score, pass)?;
         }
@@ -272,9 +368,9 @@ mod tests {
             .. Default::default()
         };
 
-        let mut model = SVM::from_csv(50, 3, "test_sets/rbf_test_set.csv", false, 2, settings);
+        let mut model = SVM::from_csv("test_sets/rbf_test_set.csv", false, 2, settings)?;
 
-        model.fit();
+        model.fit()?;
 
         let mut file = File::create("test_results/rbf_model.json").unwrap();
         let j = serde_json::to_string(&model)?;
@@ -295,7 +391,46 @@ mod tests {
             v[0] = between.sample(&mut rng);
             v[1] = between.sample(&mut rng);
             let real_score = real_boundry(&v);
-            let model_score = model.eval(&v);
+            let model_score = model.eval(&v).unwrap();
+            let pass = (real_score * model_score).is_sign_positive();
+            writeln!(file, "{},{},{}", real_score, model_score, pass)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn rbf_test_set2() -> Result<(), Box<dyn std::error::Error>> {
+        let settings = SVMSettings{
+            kernel: KernelFunction::RBF(7.0),
+            tol: 10_000.0,
+            .. Default::default()
+        };
+
+        let mut model = SVM::from_csv("test_sets/rbf_test_set2.csv", false, 2, settings)?;
+
+        model.fit()?;
+
+        let mut file = File::create("test_results/rbf_model2.json").unwrap();
+        let j = serde_json::to_string(&model)?;
+        write!(file, "{}", j)?;
+
+        let real_boundry = |x: &DVector<f64>| -> f64 {
+            0.2*(-7.0*((x[0] - 0.5).powi(2) + (x[1] - 0.5).powi(2))).exp() + 0.8*(-7.0*((x[0] + 0.2).powi(2) + (x[1] + 0.2).powi(2))).exp() - 0.1
+        };
+
+        let mut v = DVector::<f64>::zeros(2);
+        let between = Uniform::<f64>::from(-1.0..1.0);
+        let mut rng = rand::thread_rng();
+
+        let mut file = File::create("test_results/rbf_results2.csv")?;
+
+        let n = 100;
+        for _ in 0..n {
+            v[0] = between.sample(&mut rng);
+            v[1] = between.sample(&mut rng);
+            let real_score = real_boundry(&v);
+            let model_score = model.eval(&v).unwrap();
             let pass = (real_score * model_score).is_sign_positive();
             writeln!(file, "{},{},{}", real_score, model_score, pass)?;
         }
