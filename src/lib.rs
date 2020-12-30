@@ -123,6 +123,10 @@ impl SVM {
     pub fn eval(&self, data: &DVector<f64>) -> Option<f64> {
         // Evaluate new data against the model
         
+        if data.len() != self.data.ncols(){
+            return None
+        }
+
         let alp = self.alphas.as_ref()?;
         let mut sum = *self.coef.as_ref()?;
         let data_row = data.transpose();
@@ -286,6 +290,37 @@ mod tests {
         assert_eq!(model.labels[2], 1.0);
         assert_eq!(model.labels[3], -1.0);
         
+    }
+
+    #[test]
+    fn fit_error(){
+        let settings = SVMSettings{
+            kernel: KernelFunction::Polynomial(2, 1.0),
+            tol: -1_000.0,
+            .. Default::default()
+        };
+        
+        let mut model = SVM::from_csv("test_sets/linear_test_set.csv", false, 2, settings).unwrap();
+        let r = model.fit();
+        println!("{:?}", r);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn eval_before_fit() {
+        let model = SVM::from_csv("test_sets/linear_test_set.csv", false, 2, SVMSettings::default()).unwrap();
+        let v = DVector::<f64>::from_vec(vec![1.0, 2.0]);
+        assert!(model.eval(&v).is_none());
+    }
+
+    #[test]
+    fn eval_wrong_dim() {
+        let mut model = SVM::from_csv("test_sets/linear_test_set.csv", false, 2, SVMSettings::default()).unwrap();
+
+        assert!(model.fit().is_ok());
+
+        let v = DVector::<f64>::from_vec(vec![1.0, 2.0, 3.0]);
+        assert!(model.eval(&v).is_none());
     }
 
     #[test]
